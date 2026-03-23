@@ -98,6 +98,30 @@ function buildSessionCookie(token, maxAge) {
   return parts.join('; ');
 }
 
+// ── Security headers ──────────────────────────────────────────────────────────
+
+function setSecurityHeaders(res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+  // CSP for the staff panel: self-hosted SPA + Google Fonts
+  res.setHeader(
+    'Content-Security-Policy',
+    [
+      "default-src 'self'",
+      "base-uri 'self'",
+      "object-src 'none'",
+      "frame-ancestors 'none'",
+      "script-src 'self'",
+      "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+      "font-src 'self' https://fonts.gstatic.com",
+      "connect-src 'self'",
+      "img-src 'self' data: blob:",
+    ].join('; '),
+  );
+}
+
 // ── Util ──────────────────────────────────────────────────────────────────────
 
 function readBody(req) {
@@ -244,6 +268,7 @@ function serveStatic(req, res, reqUrl) {
 
 const server = http.createServer(async (req, res) => {
   try {
+    setSecurityHeaders(res);
     const reqUrl = new URL(req.url, `http://127.0.0.1:${PORT}`);
     const { pathname } = reqUrl;
 
