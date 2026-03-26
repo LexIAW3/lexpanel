@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Ensures the LexPanel service (Vite preview) is running on port 8090.
+# Ensures the LexPanel BFF server is running on port 8090.
 # Safe to run from cron or from ensure-running.sh.
 set -euo pipefail
 
 LEXPANEL_PORT=8090
 LEXPANEL_BASE_URL="http://127.0.0.1:$LEXPANEL_PORT"
 LEXPANEL_DIR="/home/paperclip/despacho/lexpanel"
-LOG_FILE="/tmp/lexreclama-watchdog.log"
+LOG_FILE="/home/paperclip/logs/lexreclama-watchdog.log"
 
 log() {
   echo "[$(date)] [lexpanel] $*" >> "$LOG_FILE"
@@ -34,12 +34,19 @@ free_port() {
 }
 
 restart_lexpanel() {
-  log "LexPanel down on :$LEXPANEL_PORT. Restarting via vite preview."
+  log "LexPanel down on :$LEXPANEL_PORT. Restarting BFF server."
 
   free_port "$LEXPANEL_PORT"
 
   cd "$LEXPANEL_DIR"
-  nohup npm run preview >> /tmp/lexpanel-server.log 2>&1 &
+  # Load server-side env vars (credentials — NOT the Vite build vars)
+  if [[ -f "$LEXPANEL_DIR/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$LEXPANEL_DIR/.env"
+    set +a
+  fi
+  nohup node server.cjs >> /home/paperclip/logs/lexpanel-server.log 2>&1 &
 
   local new_pid=$!
   sleep 2
