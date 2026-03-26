@@ -42,6 +42,9 @@ const LEXPANEL_API_KEY = process.env.LEXPANEL_API_KEY || '';
 const PANEL_USER = process.env.LEXPANEL_PANEL_USER || '';
 const PANEL_PASSWORD = process.env.LEXPANEL_PANEL_PASSWORD || '';
 const OCR_SERVER = process.env.OCR_SERVER_URL || 'http://127.0.0.1:3200';
+const OCR_SHARED_SECRET = String(
+  process.env.OCR_SHARED_SECRET || process.env.PAPERCLIP_API_KEY || ''
+).trim();
 const COOKIE_SECURE =
   process.env.NODE_ENV === 'production' ||
   String(process.env.HTTPS_ENABLED || '').toLowerCase() === 'true';
@@ -49,6 +52,38 @@ const COOKIE_SECURE =
 const SESSION_TTL_MS = 8 * 60 * 60 * 1000; // 8 hours
 const SESSION_COOKIE = 'lex_panel_session';
 const sessions = new Map(); // token → { username, expiresAtMs }
+
+// ── Login rate limiting ────────────────────────────────────────────────────────
+const LOGIN_MAX_ATTEMPTS = 10;       // max failed attempts before lockout
+const LOGIN_WINDOW_MS    = 15 * 60 * 1000; // 15-minute rolling window
+const loginAttempts = new Map();    // ip → { count, windowStart }
+
+function getClientIp(req) {
+  // nginx injects X-Real-IP; fall back to socket address for direct access
+  return String(req.headers['x-real-ip'] || req.socket.remoteAddress || 'unknown');
+}
+
+function isRateLimited(ip) {
+  const now = Date.now();
+  const entry = loginAttempts.get(ip);
+  if (!entry) return false;
+  if (now - entry.windowStart > LOGIN_WINDOW_MS) { loginAttempts.delete(ip); return false; }
+  return entry.count >= LOGIN_MAX_ATTEMPTS;
+}
+
+function recordFailedLogin(ip) {
+  const now = Date.now();
+  const entry = loginAttempts.get(ip);
+  if (!entry || now - entry.windowStart > LOGIN_WINDOW_MS) {
+    loginAttempts.set(ip, { count: 1, windowStart: now });
+  } else {
+    entry.count += 1;
+  }
+}
+
+function clearLoginAttempts(ip) {
+  loginAttempts.delete(ip);
+}
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -144,15 +179,25 @@ async function handleLogin(req, res) {
   if (!PANEL_USER || !PANEL_PASSWORD || !LEXPANEL_API_KEY) {
     return sendJson(res, 503, { error: 'Panel no configurado. Contacte al administrador.' });
   }
+  const ip = getClientIp(req);
+  if (isRateLimited(ip)) {
+    return sendJson(res, 429, { error: 'Demasiados intentos fallidos. Inténtelo de nuevo en 15 minutos.' });
+  }
   let body;
   try {
     body = JSON.parse((await readBody(req)).toString('utf8'));
   } catch {
     return sendJson(res, 400, { error: 'JSON inválido' });
   }
-  if (!body || body.username !== PANEL_USER || body.password !== PANEL_PASSWORD) {
+  const validUser = typeof body?.username === 'string' &&
+    crypto.timingSafeEqual(Buffer.from(body.username.padEnd(256)), Buffer.from(PANEL_USER.padEnd(256)));
+  const validPass = typeof body?.password === 'string' &&
+    crypto.timingSafeEqual(Buffer.from(body.password.padEnd(256)), Buffer.from(PANEL_PASSWORD.padEnd(256)));
+  if (!validUser || !validPass) {
+    recordFailedLogin(ip);
     return sendJson(res, 401, { error: 'Usuario o contraseña incorrectos' });
   }
+  clearLoginAttempts(ip);
   const token = crypto.randomBytes(32).toString('hex');
   sessions.set(token, { username: body.username, expiresAtMs: Date.now() + SESSION_TTL_MS });
   res.setHeader('Set-Cookie', buildSessionCookie(token, Math.floor(SESSION_TTL_MS / 1000)));
@@ -164,6 +209,12 @@ function handleLogout(req, res) {
   if (token) sessions.delete(token);
   res.setHeader('Set-Cookie', buildSessionCookie('', 0));
   sendJson(res, 200, { ok: true });
+}
+
+function handleSessionCheck(req, res) {
+  const session = getSession(req);
+  if (!session) return sendJson(res, 401, { error: 'No autenticado' });
+  sendJson(res, 200, { ok: true, username: session.username });
 }
 
 // ── Paperclip proxy ───────────────────────────────────────────────────────────
@@ -216,6 +267,12 @@ async function handleOcrProxy(req, res, reqUrl) {
       fetchOpts.headers = { 'content-type': req.headers['content-type'] };
     }
   }
+  if (OCR_SHARED_SECRET) {
+    fetchOpts.headers = {
+      ...(fetchOpts.headers || {}),
+      'x-ocr-shared-secret': OCR_SHARED_SECRET,
+    };
+  }
 
   try {
     const r = await fetch(`${OCR_SERVER}${fullPath}`, fetchOpts);
@@ -258,6 +315,10 @@ function serveStatic(req, res, reqUrl) {
     if (e === '.js' || e === '.css') {
       // Vite outputs content-hashed filenames — safe to cache aggressively
       headers['Cache-Control'] = 'public, max-age=31536000, immutable';
+    } else if (e && e !== '.html') {
+      // Non-hashed static assets (favicon/images/fonts) should be cacheable
+      // with a shorter TTL so branding/content updates propagate quickly.
+      headers['Cache-Control'] = 'public, max-age=86400';
     }
     res.writeHead(200, headers);
     res.end(data);
@@ -278,6 +339,9 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/api/lexpanel/logout' && req.method === 'POST') {
       handleLogout(req, res); return;
     }
+    if (pathname === '/api/lexpanel/session' && req.method === 'GET') {
+      handleSessionCheck(req, res); return;
+    }
     if (pathname.startsWith('/api/lexpanel/proxy/')) {
       await handlePaperclipProxy(req, res, reqUrl); return;
     }
@@ -295,11 +359,14 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-// Periodically sweep expired sessions to prevent unbounded memory growth
+// Periodically sweep expired sessions and stale rate-limit entries
 setInterval(() => {
   const now = Date.now();
   for (const [token, session] of sessions) {
     if (session.expiresAtMs <= now) sessions.delete(token);
+  }
+  for (const [ip, entry] of loginAttempts) {
+    if (now - entry.windowStart > LOGIN_WINDOW_MS) loginAttempts.delete(ip);
   }
 }, 30 * 60 * 1000).unref();
 
@@ -307,4 +374,12 @@ server.listen(PORT, '127.0.0.1', () => {
   console.log(`[LexPanel BFF] http://127.0.0.1:${PORT}`);
   if (!LEXPANEL_API_KEY) console.warn('[LexPanel BFF] WARN: LEXPANEL_API_KEY not set — proxy disabled');
   if (!PANEL_USER || !PANEL_PASSWORD) console.warn('[LexPanel BFF] WARN: credentials not set — login disabled');
+});
+
+// Prevent unhandled errors from crashing the process (and wiping in-memory sessions)
+process.on('uncaughtException', (err) => {
+  console.error('[LexPanel BFF] Uncaught exception:', err.message, err.stack);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[LexPanel BFF] Unhandled rejection:', reason);
 });

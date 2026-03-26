@@ -18,8 +18,6 @@ import {
   uploadDocument,
 } from './lib/paperclip';
 
-const ADMIN_USER = import.meta.env.VITE_ADMIN_USER || 'abogado';
-const ADMIN_PASSWORD = import.meta.env.VITE_ADMIN_PASSWORD || 'lexreclama2026';
 const POLL_MS = 30000;
 const MAX_DOC_SIZE = 10 * 1024 * 1024;
 const ALLOWED_DOC_TYPES = ['image/jpeg', 'image/png', 'application/pdf'];
@@ -298,21 +296,36 @@ function Login({ onLogin }) {
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
 
-  const submit = (e) => {
+  const submit = async (e) => {
     e.preventDefault();
-    if (username === ADMIN_USER && password === ADMIN_PASSWORD) {
+    try {
+      const r = await fetch('/api/lexpanel/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        setError(data.error || 'Usuario o contraseña incorrectos');
+        return;
+      }
       setError('');
       onLogin(username);
-      return;
+    } catch {
+      setError('Error de conexión. Inténtalo de nuevo.');
     }
-    setError('Usuario o contraseña incorrectos');
   };
 
   return (
     <main className="login-root">
       <div className="login-card">
         <div className="login-logo">
-          <span className="login-logo-mark">L</span>
+          <span className="login-logo-mark" aria-hidden="true">
+            <svg width="36" height="36" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <path d="M2.78824 11V4.09091H4.249V9.79563H7.211V11H2.78824Z" fill="white"/>
+              <path d="M8.17838 11V4.09091H10.9042C11.426 4.09091 11.8713 4.18424 12.2402 4.37092C12.6113 4.55534 12.8935 4.81735 13.0869 5.15696C13.2826 5.49432 13.3804 5.89128 13.3804 6.34783C13.3804 6.80664 13.2815 7.20135 13.0836 7.53196C12.8856 7.86032 12.5989 8.11222 12.2233 8.28764C11.85 8.46307 11.3979 8.55078 10.8671 8.55078H9.04201V7.37678H10.631C10.9099 7.37678 11.1415 7.33854 11.3259 7.26207C11.5104 7.18561 11.6475 7.0709 11.7375 6.91797C11.8297 6.76503 11.8758 6.57499 11.8758 6.34783C11.8758 6.11843 11.8297 5.92501 11.7375 5.76758C11.6475 5.61014 11.5092 5.49094 11.3226 5.40998C11.1381 5.32676 10.9054 5.28516 10.6242 5.28516H9.63914V11H8.17838ZM11.9096 7.85582L13.6267 11H12.0141L10.3341 7.85582H11.9096Z" fill="#2563EB"/>
+            </svg>
+          </span>
         </div>
         <h1 className="login-title">LexPanel</h1>
         <p className="login-subtitle">Acceso para equipo jurídico</p>
@@ -440,8 +453,10 @@ function CaseDetail({ issue, onClose }) {
 // ── Main app ──────────────────────────────────────────────────────────────────
 
 function App() {
-  const [isAuthed, setIsAuthed] = useState(localStorage.getItem('lexpanel_authed') === '1');
-  const [username, setUsername] = useState(localStorage.getItem('lexpanel_user') || ADMIN_USER);
+  const storedAuthed = localStorage.getItem('lexpanel_authed') === '1';
+  const [isAuthed, setIsAuthed] = useState(false);
+  const [sessionChecked, setSessionChecked] = useState(!storedAuthed); // skip check if not stored
+  const [username, setUsername] = useState(localStorage.getItem('lexpanel_user') || 'abogado');
   const [theme, setTheme] = useState(localStorage.getItem('lexpanel_theme') || 'dark');
   const [issues, setIssues] = useState([]);
   const [selectedIssueId, setSelectedIssueId] = useState('');
@@ -455,6 +470,27 @@ function App() {
     localStorage.setItem('lexpanel_theme', theme);
   }, [theme]);
 
+  // On startup, if localStorage claims authed, verify session is still valid server-side
+  // before rendering the main panel. Prevents the login loop caused by in-memory session loss.
+  useEffect(() => {
+    if (!storedAuthed) return; // no stored auth — go straight to login
+    fetch('/api/lexpanel/session')
+      .then((r) => {
+        if (r.ok) {
+          setIsAuthed(true);
+        } else {
+          localStorage.removeItem('lexpanel_authed');
+          localStorage.removeItem('lexpanel_user');
+        }
+      })
+      .catch(() => {
+        // Server unreachable — clear auth flag and show login
+        localStorage.removeItem('lexpanel_authed');
+        localStorage.removeItem('lexpanel_user');
+      })
+      .finally(() => setSessionChecked(true));
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   useEffect(() => {
     if (!isAuthed) return;
     let active = true;
@@ -463,6 +499,8 @@ function App() {
       try {
         const [agentList, issueList] = await Promise.all([fetchAgents(), fetchIssues()]);
         if (!active) return;
+        // null = session expired, lexpanel:session-expired event handles logout
+        if (!agentList || !issueList) return;
         const legalIds = new Set(
           agentList.filter((a) => LEGAL_AGENT_NAMES.has(a?.name)).map((a) => a.id),
         );
@@ -508,6 +546,20 @@ function App() {
     return { total, inProgress, pending, totalCobrado };
   }, [issues]);
 
+  const logout = async () => {
+    try { await fetch('/api/lexpanel/logout', { method: 'POST' }); } catch { /* ignore */ }
+    localStorage.removeItem('lexpanel_authed');
+    localStorage.removeItem('lexpanel_user');
+    setIsAuthed(false);
+  };
+
+  // Handle server-side session expiry dispatched by paperclip.js
+  useEffect(() => {
+    const onExpired = () => logout();
+    window.addEventListener('lexpanel:session-expired', onExpired);
+    return () => window.removeEventListener('lexpanel:session-expired', onExpired);
+  }, []);
+
   const onLogin = (user) => {
     localStorage.setItem('lexpanel_authed', '1');
     localStorage.setItem('lexpanel_user', user);
@@ -515,12 +567,7 @@ function App() {
     setIsAuthed(true);
   };
 
-  const logout = () => {
-    localStorage.removeItem('lexpanel_authed');
-    localStorage.removeItem('lexpanel_user');
-    setIsAuthed(false);
-  };
-
+  if (!sessionChecked) return null; // brief wait while session is validated
   if (!isAuthed) return <Login onLogin={onLogin} />;
 
   return (
@@ -529,7 +576,12 @@ function App() {
       <aside className="sidebar">
         <div className="sidebar-top">
           <div className="sidebar-brand">
-            <span className="sidebar-logo-mark">L</span>
+            <span className="sidebar-logo-mark" aria-hidden="true">
+              <svg width="18" height="18" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M2.78824 11V4.09091H4.249V9.79563H7.211V11H2.78824Z" fill="white"/>
+                <path d="M8.17838 11V4.09091H10.9042C11.426 4.09091 11.8713 4.18424 12.2402 4.37092C12.6113 4.55534 12.8935 4.81735 13.0869 5.15696C13.2826 5.49432 13.3804 5.89128 13.3804 6.34783C13.3804 6.80664 13.2815 7.20135 13.0836 7.53196C12.8856 7.86032 12.5989 8.11222 12.2233 8.28764C11.85 8.46307 11.3979 8.55078 10.8671 8.55078H9.04201V7.37678H10.631C10.9099 7.37678 11.1415 7.33854 11.3259 7.26207C11.5104 7.18561 11.6475 7.0709 11.7375 6.91797C11.8297 6.76503 11.8758 6.57499 11.8758 6.34783C11.8758 6.11843 11.8297 5.92501 11.7375 5.76758C11.6475 5.61014 11.5092 5.49094 11.3226 5.40998C11.1381 5.32676 10.9054 5.28516 10.6242 5.28516H9.63914V11H8.17838ZM11.9096 7.85582L13.6267 11H12.0141L10.3341 7.85582H11.9096Z" fill="#2563EB"/>
+              </svg>
+            </span>
             <span className="sidebar-brand-name">LexPanel</span>
           </div>
 
