@@ -42,9 +42,7 @@ const LEXPANEL_API_KEY = process.env.LEXPANEL_API_KEY || '';
 const PANEL_USER = process.env.LEXPANEL_PANEL_USER || '';
 const PANEL_PASSWORD = process.env.LEXPANEL_PANEL_PASSWORD || '';
 const OCR_SERVER = process.env.OCR_SERVER_URL || 'http://127.0.0.1:3200';
-const OCR_SHARED_SECRET = String(
-  process.env.OCR_SHARED_SECRET || process.env.PAPERCLIP_API_KEY || ''
-).trim();
+const OCR_SHARED_SECRET = String(process.env.OCR_SHARED_SECRET || '').trim();
 const COOKIE_SECURE =
   process.env.NODE_ENV === 'production' ||
   String(process.env.HTTPS_ENABLED || '').toLowerCase() === 'true';
