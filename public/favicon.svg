@@ -1,30 +1,5 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
-  <defs>
-    <!-- Brand gradient: indigo → cyan, 135° -->
-    <linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%"   stop-color="#5b72ff"/>
-      <stop offset="100%" stop-color="#38d9ff"/>
-    </linearGradient>
-    <!-- Inner glow for depth -->
-    <radialGradient id="glow" cx="30%" cy="20%" r="70%">
-      <stop offset="0%" stop-color="rgba(255,255,255,0.18)"/>
-      <stop offset="100%" stop-color="rgba(255,255,255,0)"/>
-    </radialGradient>
-  </defs>
-
-  <!-- Squircle background — rx=8 matches logo-mark -->
-  <rect width="32" height="32" rx="8" fill="url(#g)"/>
-  <!-- Subtle inner highlight -->
-  <rect width="32" height="32" rx="8" fill="url(#glow)"/>
-
-  <!--
-    Geometric L — two rects, pixel-grid aligned.
-    Vertical bar: 5×17px at (7,7). Horizontal bar: 14×4px at (7,20).
-    Crisp at 16×16 and 32×32.
-  -->
-  <rect x="7"  y="7"  width="5" height="17" rx="1.5" fill="#ffffff"/>
-  <rect x="7"  y="20" width="14" height="4"  rx="1.5" fill="#ffffff"/>
-
-  <!-- Accent dot — top-right, links to cyan side of gradient -->
-  <circle cx="24" cy="9" r="2.5" fill="#ffffff" opacity="0.72"/>
+<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+<rect width="16" height="16" rx="2" fill="black"/>
+<path d="M2.78824 11V4.09091H4.249V9.79563H7.211V11H2.78824Z" fill="white"/>
+<path d="M8.17838 11V4.09091H10.9042C11.426 4.09091 11.8713 4.18424 12.2402 4.37092C12.6113 4.55534 12.8935 4.81735 13.0869 5.15696C13.2826 5.49432 13.3804 5.89128 13.3804 6.34783C13.3804 6.80664 13.2815 7.20135 13.0836 7.53196C12.8856 7.86032 12.5989 8.11222 12.2233 8.28764C11.85 8.46307 11.3979 8.55078 10.8671 8.55078H9.04201V7.37678H10.631C10.9099 7.37678 11.1415 7.33854 11.3259 7.26207C11.5104 7.18561 11.6475 7.0709 11.7375 6.91797C11.8297 6.76503 11.8758 6.57499 11.8758 6.34783C11.8758 6.11843 11.8297 5.92501 11.7375 5.76758C11.6475 5.61014 11.5092 5.49094 11.3226 5.40998C11.1381 5.32676 10.9054 5.28516 10.6242 5.28516H9.63914V11H8.17838ZM11.9096 7.85582L13.6267 11H12.0141L10.3341 7.85582H11.9096Z" fill="#2563EB"/>
 </svg>

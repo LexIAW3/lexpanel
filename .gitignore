@@ -9,8 +9,13 @@ lerna-debug.log*
 
 node_modules
 dist
+bff-dist
 dist-ssr
 *.local
+
+# Secrets — never commit
+.env
+.env.*
 
 # Editor directories and files
 .vscode/*

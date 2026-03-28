@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Inter:wght@400;500;600&display=swap');
 
 @tailwind base;
 @tailwind components;
@@ -122,19 +122,16 @@ h1, h2, h3, h4, h5, h6 {
   width: 32px;
   height: 32px;
   border-radius: 8px;
-  background: var(--accent);
-  color: #fff;
-  font-size: 15px;
-  font-weight: 700;
-  letter-spacing: -0.04em;
+  background: #0a0a0a;
   flex-shrink: 0;
 }
 
 .sidebar-brand-name {
-  font-size: 15px;
-  font-weight: 600;
+  font-family: 'Bebas Neue', Impact, 'Arial Narrow', sans-serif;
+  font-size: 17px;
+  font-weight: 400;
   color: #fff;
-  letter-spacing: -0.02em;
+  letter-spacing: 0.06em;
 }
 
 .sidebar-nav { display: flex; flex-direction: column; gap: 2px; }
@@ -785,14 +782,10 @@ h1, h2, h3, h4, h5, h6 {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 48px;
-  height: 48px;
+  width: 56px;
+  height: 56px;
   border-radius: 14px;
-  background: var(--accent);
-  color: #fff;
-  font-size: 22px;
-  font-weight: 700;
-  letter-spacing: -0.04em;
+  background: #0a0a0a;
 }
 
 .login-title {
