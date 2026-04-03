@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   LEGAL_AGENT_NAMES,
   STATUS_OPTIONS,
@@ -21,8 +21,131 @@ import {
 const POLL_MS = 30000;
 const MAX_DOC_SIZE = 10 * 1024 * 1024;
 const ALLOWED_DOC_TYPES = ['image/jpeg', 'image/png', 'application/pdf'];
+const INVOICE_STORAGE_KEY = 'lexpanel_invoices_v1';
+const INVOICE_TYPE_OPTIONS = [
+  { value: 'inicial', label: 'Inicial' },
+  { value: 'complementaria', label: 'Complementaria' },
+  { value: 'exito', label: 'Honorarios de exito' },
+];
+const INVOICE_STATE_OPTIONS = ['Todos', 'Borrador', 'Enviada', 'Pagada'];
 
-// ── Icons ────────────────────────────────────────────────────────────────────
+function normalizeText(input) {
+  return String(input || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
+function getSeriesPrefix(caseType) {
+  const type = normalizeText(caseType);
+  if (type.includes('irph') || type.includes('clausul') || type.includes('banc')) return 'IRPH';
+  if (type.includes('monitor') || type.includes('deuda')) return 'MON';
+  if (type.includes('administ')) return 'ADM';
+  return 'GEN';
+}
+
+function buildInvoiceNumber(invoices, prefix, nowDate = new Date()) {
+  const year = nowDate.getUTCFullYear();
+  const maxInSeries = invoices
+    .filter((invoice) => invoice.seriesPrefix === prefix && invoice.year === year)
+    .reduce((max, invoice) => Math.max(max, Number(invoice.sequence) || 0), 0);
+  const sequence = maxInSeries + 1;
+  return {
+    year,
+    sequence,
+    invoiceNumber: `${prefix}-${year}-${String(sequence).padStart(4, '0')}`,
+  };
+}
+
+function canCreateSuccessFee(issue) {
+  if (!issue) return false;
+  const closed = issue.status === 'done' || issue.status === 'cancelled';
+  const recovered = Number(issue.details?.importeCobrado || 0) > 0;
+  if (closed && !recovered) return false;
+  return true;
+}
+
+function formatInvoiceType(type) {
+  return INVOICE_TYPE_OPTIONS.find((t) => t.value === type)?.label || type;
+}
+
+function formatInvoiceAmountText(value) {
+  return `${Number(value || 0).toFixed(2)} EUR`;
+}
+
+function escapePdfText(input) {
+  return String(input || '').replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
+}
+
+function buildInvoicePdfBlob(invoice) {
+  const lines = [
+    `Factura ${invoice.invoiceNumber}`,
+    `Fecha: ${new Date(invoice.createdAt).toLocaleDateString('es-ES')}`,
+    `Serie: ${invoice.seriesPrefix}`,
+    `Tipo: ${formatInvoiceType(invoice.invoiceType)}`,
+    `Cliente: ${invoice.clientName}`,
+    `Email: ${invoice.clientEmail}`,
+    `Expediente: ${invoice.issueIdentifier}`,
+    `Concepto: ${invoice.concept}`,
+    `Importe: ${formatInvoiceAmountText(invoice.amount)}`,
+    `Estado: ${invoice.state}`,
+  ];
+
+  const textContent = lines
+    .map((line, index) => `1 0 0 1 48 ${790 - index * 22} Tm (${escapePdfText(line)}) Tj`)
+    .join('\n');
+  const stream = `BT\n/F1 12 Tf\n${textContent}\nET`;
+
+  const objects = [
+    '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj',
+    '2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj',
+    '3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj',
+    `4 0 obj\n<< /Length ${stream.length} >>\nstream\n${stream}\nendstream\nendobj`,
+    '5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj',
+  ];
+
+  let pdf = '%PDF-1.4\n';
+  const offsets = [0];
+  for (const object of objects) {
+    offsets.push(pdf.length);
+    pdf += `${object}\n`;
+  }
+
+  const xrefStart = pdf.length;
+  pdf += `xref\n0 ${objects.length + 1}\n`;
+  pdf += '0000000000 65535 f \n';
+  for (let i = 1; i <= objects.length; i += 1) {
+    pdf += `${String(offsets[i]).padStart(10, '0')} 00000 n \n`;
+  }
+  pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefStart}\n%%EOF`;
+
+  return new Blob([pdf], { type: 'application/pdf' });
+}
+
+function downloadInvoicePdf(invoice) {
+  const blob = buildInvoicePdfBlob(invoice);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `factura-${invoice.invoiceNumber}.pdf`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function getBillingPrefillFromUrl() {
+  try {
+    const params = new URLSearchParams(window.location.search);
+    return {
+      issueId: params.get('issueId') || '',
+      invoiceType: params.get('invoiceType') || 'inicial',
+      concept: params.get('concept') || '',
+    };
+  } catch {
+    return { issueId: '', invoiceType: 'inicial', concept: '' };
+  }
+}
 
 function IconBriefcase() {
   return (
@@ -103,7 +226,16 @@ function IconUpload() {
   );
 }
 
-// ── Status badge ─────────────────────────────────────────────────────────────
+function IconReceipt() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M4 3h16v18l-2.5-1.8L15 21l-2.5-1.8L10 21l-2.5-1.8L5 21 4 20z" />
+      <line x1="8" y1="8" x2="16" y2="8" />
+      <line x1="8" y1="12" x2="16" y2="12" />
+      <line x1="8" y1="16" x2="13" y2="16" />
+    </svg>
+  );
+}
 
 function StatusBadge({ status }) {
   const style = STATUS_STYLE[status] || STATUS_STYLE['En proceso'];
@@ -118,8 +250,6 @@ function StatusBadge({ status }) {
   );
 }
 
-// ── KPI card ─────────────────────────────────────────────────────────────────
-
 function StatCard({ label, value, accent }) {
   return (
     <div className="stat-card">
@@ -128,8 +258,6 @@ function StatCard({ label, value, accent }) {
     </div>
   );
 }
-
-// ── Document section ──────────────────────────────────────────────────────────
 
 function fileTypeLabel(mimeType) {
   if (mimeType === 'application/pdf') return 'PDF';
@@ -148,7 +276,7 @@ function DocumentsSection({ issueIdentifier }) {
   const [error, setError] = useState('');
   const [isDragging, setIsDragging] = useState(false);
 
-  const loadDocuments = async () => {
+  const loadDocuments = useCallback(async () => {
     if (!issueIdentifier) return;
     setLoadingDocs(true);
     try {
@@ -161,19 +289,19 @@ function DocumentsSection({ issueIdentifier }) {
     } finally {
       setLoadingDocs(false);
     }
-  };
+  }, [issueIdentifier]);
 
   useEffect(() => {
     setExpandedId('');
     setTextByFileId({});
     if (!issueIdentifier) { setDocuments([]); return; }
     loadDocuments();
-  }, [issueIdentifier]);
+  }, [issueIdentifier, loadDocuments]);
 
   const onUpload = async (file) => {
     if (!file || uploading) return;
     if (!ALLOWED_DOC_TYPES.includes(file.type)) { setError('Solo se permiten archivos JPG, PNG o PDF'); return; }
-    if (file.size > MAX_DOC_SIZE) { setError('El archivo supera el tamaño máximo de 10MB'); return; }
+    if (file.size > MAX_DOC_SIZE) { setError('El archivo supera el tamaño maximo de 10MB'); return; }
     setUploading(true);
     setUploadProgress(0);
     setError('');
@@ -231,14 +359,14 @@ function DocumentsSection({ issueIdentifier }) {
       {uploading ? (
         <div className="upload-progress">
           <div className="upload-progress-bar" style={{ width: `${uploadProgress}%` }} />
-          <span>Procesando OCR… {uploadProgress}%</span>
+          <span>Procesando OCR... {uploadProgress}%</span>
         </div>
       ) : null}
 
       {error ? <p className="doc-error">{error}</p> : null}
 
       {loadingDocs ? (
-        <p className="doc-empty">Cargando documentos…</p>
+        <p className="doc-empty">Cargando documentos...</p>
       ) : documents.length === 0 ? (
         <p className="doc-empty">No hay documentos en este caso</p>
       ) : (
@@ -276,7 +404,7 @@ function DocumentsSection({ issueIdentifier }) {
                   {isExpanded ? (
                     <textarea
                       readOnly
-                      value={extractedText === undefined ? 'Cargando texto extraido…' : extractedText}
+                      value={extractedText === undefined ? 'Cargando texto extraido...' : extractedText}
                       className="doc-text-area"
                     />
                   ) : null}
@@ -288,8 +416,6 @@ function DocumentsSection({ issueIdentifier }) {
     </div>
   );
 }
-
-// ── Login ─────────────────────────────────────────────────────────────────────
 
 function Login({ onLogin }) {
   const [username, setUsername] = useState('');
@@ -306,13 +432,13 @@ function Login({ onLogin }) {
       });
       const data = await r.json().catch(() => ({}));
       if (!r.ok) {
-        setError(data.error || 'Usuario o contraseña incorrectos');
+        setError(data.error || 'Usuario o contrasena incorrectos');
         return;
       }
       setError('');
       onLogin(username);
     } catch {
-      setError('Error de conexión. Inténtalo de nuevo.');
+      setError('Error de conexion. Intentalo de nuevo.');
     }
   };
 
@@ -328,7 +454,7 @@ function Login({ onLogin }) {
           </span>
         </div>
         <h1 className="login-title">LexPanel</h1>
-        <p className="login-subtitle">Acceso para equipo jurídico</p>
+        <p className="login-subtitle">Acceso para equipo juridico</p>
 
         <form onSubmit={submit} className="login-form">
           <label className="field-label">
@@ -343,7 +469,7 @@ function Login({ onLogin }) {
             />
           </label>
           <label className="field-label">
-            Contraseña
+            Contrasena
             <input
               type="password"
               value={password}
@@ -362,19 +488,17 @@ function Login({ onLogin }) {
   );
 }
 
-// ── Case detail panel ─────────────────────────────────────────────────────────
-
-function CaseDetail({ issue, onClose }) {
+function CaseDetail({ issue, onClose, onAddAdditionalCharge }) {
   const [comments, setComments] = useState([]);
 
   useEffect(() => {
-    if (!issue) { setComments([]); return; }
+    if (!issue) return undefined;
     let active = true;
     fetchIssueComments(issue.id)
       .then((list) => { if (active) setComments(Array.isArray(list) ? list : []); })
       .catch(() => { if (active) setComments([]); });
     return () => { active = false; };
-  }, [issue?.id]);
+  }, [issue]);
 
   if (!issue) {
     return (
@@ -385,7 +509,7 @@ function CaseDetail({ issue, onClose }) {
     );
   }
 
-  const { details, lexStatus, identifier, title, updatedAt } = issue;
+  const { details, lexStatus, identifier, updatedAt } = issue;
 
   return (
     <div className="detail-panel">
@@ -406,16 +530,19 @@ function CaseDetail({ issue, onClose }) {
         <div className="detail-section">
           <div className="detail-section-header">
             <h3 className="detail-section-title">Datos del caso</h3>
+            <button type="button" className="detail-action-btn" onClick={() => onAddAdditionalCharge(issue)}>
+              Anadir cobro adicional
+            </button>
           </div>
           <dl className="detail-grid">
             {[
               ['Cliente', details.nombre],
               ['Email', details.email],
-              ['Teléfono', details.telefono],
+              ['Telefono', details.telefono],
               ['Tipo', details.tipo],
               ['Importe reclamado', formatMoney(details.importeReclamado)],
               ['Importe cobrado', formatMoney(details.importeCobrado)],
-              ['Última actualización', formatDate(updatedAt)],
+              ['Ultima actualizacion', formatDate(updatedAt)],
             ].map(([k, v]) => (
               <div key={k} className="detail-row">
                 <dt className="detail-dt">{k}</dt>
@@ -433,7 +560,7 @@ function CaseDetail({ issue, onClose }) {
             <span className="detail-section-count">{comments.length}</span>
           </div>
           {comments.length === 0 ? (
-            <p className="doc-empty">Sin comentarios todavía</p>
+            <p className="doc-empty">Sin comentarios todavia</p>
           ) : (
             <ul className="comments-list">
               {comments.map((c) => (
@@ -450,14 +577,342 @@ function CaseDetail({ issue, onClose }) {
   );
 }
 
-// ── Main app ──────────────────────────────────────────────────────────────────
+function BillingModule({ issues }) {
+  const [invoices, setInvoices] = useState(() => {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(INVOICE_STORAGE_KEY) || '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  });
+  const initialPrefill = getBillingPrefillFromUrl();
+  const [issueId, setIssueId] = useState(initialPrefill.issueId);
+  const [invoiceType, setInvoiceType] = useState(initialPrefill.invoiceType);
+  const [concept, setConcept] = useState(initialPrefill.concept);
+  const [amount, setAmount] = useState('');
+  const [statusFilter, setStatusFilter] = useState('Todos');
+  const [seriesFilter, setSeriesFilter] = useState('Todas');
+  const [clientFilter, setClientFilter] = useState('');
+  const [issueFilter, setIssueFilter] = useState('');
+  const [formError, setFormError] = useState('');
+  const [flash, setFlash] = useState('');
+
+  useEffect(() => {
+    localStorage.setItem(INVOICE_STORAGE_KEY, JSON.stringify(invoices));
+  }, [invoices]);
+
+  const issueMap = useMemo(() => {
+    const map = new Map();
+    for (const issue of issues) map.set(issue.id, issue);
+    return map;
+  }, [issues]);
+
+  const orderedIssues = useMemo(
+    () => issues.slice().sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0)),
+    [issues],
+  );
+
+  const selectedIssue = issueMap.get(issueId) || null;
+
+  const uniqueSeries = useMemo(() => {
+    const set = new Set(invoices.map((invoice) => invoice.seriesPrefix));
+    return ['Todas', ...Array.from(set).sort()];
+  }, [invoices]);
+
+  const filteredInvoices = useMemo(() => {
+    return invoices
+      .filter((invoice) => statusFilter === 'Todos' || invoice.state === statusFilter)
+      .filter((invoice) => seriesFilter === 'Todas' || invoice.seriesPrefix === seriesFilter)
+      .filter((invoice) => {
+        if (!clientFilter.trim()) return true;
+        return normalizeText(invoice.clientName).includes(normalizeText(clientFilter));
+      })
+      .filter((invoice) => {
+        if (!issueFilter.trim()) return true;
+        return normalizeText(invoice.issueIdentifier).includes(normalizeText(issueFilter));
+      })
+      .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+  }, [invoices, statusFilter, seriesFilter, clientFilter, issueFilter]);
+
+  const billingStats = useMemo(() => {
+    const total = invoices.length;
+    const sent = invoices.filter((invoice) => invoice.state === 'Enviada').length;
+    const paid = invoices.filter((invoice) => invoice.state === 'Pagada').length;
+    const totalAmount = invoices.reduce((sum, invoice) => sum + Number(invoice.amount || 0), 0);
+    return { total, sent, paid, totalAmount };
+  }, [invoices]);
+
+  const createInvoice = (e) => {
+    e.preventDefault();
+    const issue = issueMap.get(issueId);
+    if (!issue) {
+      setFormError('Selecciona un expediente.');
+      return;
+    }
+    const numericAmount = Number(amount);
+    if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+      setFormError('Introduce un importe valido mayor que 0.');
+      return;
+    }
+    if (!concept.trim()) {
+      setFormError('El concepto es obligatorio.');
+      return;
+    }
+    if (invoiceType === 'exito' && !canCreateSuccessFee(issue)) {
+      setFormError('No se puede facturar exito: expediente cerrado sin recuperacion economica.');
+      return;
+    }
+
+    const now = new Date();
+    const prefix = getSeriesPrefix(issue.details?.tipo);
+    const numbering = buildInvoiceNumber(invoices, prefix, now);
+    const clientEmail = issue.details?.email && issue.details.email !== '-' ? issue.details.email : '';
+
+    const invoice = {
+      id: `inv_${now.getTime()}_${Math.random().toString(36).slice(2, 8)}`,
+      invoiceNumber: numbering.invoiceNumber,
+      seriesPrefix: prefix,
+      year: numbering.year,
+      sequence: numbering.sequence,
+      invoiceType,
+      concept: concept.trim(),
+      amount: numericAmount,
+      issueId: issue.id,
+      issueIdentifier: issue.identifier,
+      clientId: clientEmail ? clientEmail.toLowerCase() : issue.id,
+      clientName: issue.details?.nombre || 'Cliente',
+      clientEmail,
+      state: 'Borrador',
+      createdAt: now.toISOString(),
+      sentAt: null,
+      linkedIssueStatus: issue.status,
+    };
+
+    setInvoices((prev) => [invoice, ...prev]);
+    setFormError('');
+    setFlash(`Factura ${invoice.invoiceNumber} creada y vinculada a ${issue.identifier}.`);
+    setAmount('');
+    setConcept(invoiceType === 'complementaria' ? 'Cobro adicional' : '');
+  };
+
+  const updateInvoiceState = (invoiceId, nextState) => {
+    setInvoices((prev) => prev.map((invoice) => (invoice.id === invoiceId ? { ...invoice, state: nextState } : invoice)));
+  };
+
+  const sendInvoiceEmail = (invoice) => {
+    if (!invoice.clientEmail) {
+      setFormError('El expediente no tiene email de cliente para el envio.');
+      return;
+    }
+
+    const subject = `Factura ${invoice.invoiceNumber}`;
+    const body = [
+      `Hola ${invoice.clientName},`,
+      '',
+      `Adjuntamos la factura ${invoice.invoiceNumber}.`,
+      `Concepto: ${invoice.concept}`,
+      `Importe: ${formatMoney(invoice.amount)}`,
+      `Expediente: ${invoice.issueIdentifier}`,
+      '',
+      'Gracias.',
+    ].join('\n');
+
+    const mailto = `mailto:${encodeURIComponent(invoice.clientEmail)}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    const a = document.createElement('a');
+    a.href = mailto;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setInvoices((prev) => prev.map((current) => (current.id === invoice.id
+      ? { ...current, state: current.state === 'Pagada' ? 'Pagada' : 'Enviada', sentAt: new Date().toISOString() }
+      : current)));
+    setFlash(`Email de factura ${invoice.invoiceNumber} preparado para ${invoice.clientEmail}.`);
+  };
+
+  const successFeeBlocked = invoiceType === 'exito' && selectedIssue && !canCreateSuccessFee(selectedIssue);
+
+  return (
+    <div className="billing-layout">
+      <div className="page-header">
+        <div>
+          <h1 className="page-title">Facturacion</h1>
+          <p className="page-subtitle">Series automaticas por tipo de expediente y numeracion correlativa anual</p>
+        </div>
+      </div>
+
+      <div className="stats-row">
+        <StatCard label="Total facturas" value={billingStats.total} />
+        <StatCard label="Enviadas" value={billingStats.sent} />
+        <StatCard label="Pagadas" value={billingStats.paid} accent />
+        <StatCard label="Importe total" value={formatMoney(billingStats.totalAmount)} accent />
+      </div>
+
+      {formError ? <div className="error-banner">{formError}</div> : null}
+      {flash ? <div className="success-banner">{flash}</div> : null}
+
+      <section className="billing-card">
+        <h2 className="billing-title">Nueva factura</h2>
+        <form className="billing-form" onSubmit={createInvoice}>
+          <label className="field-label">
+            Expediente
+            <select className="field-input" value={issueId} onChange={(e) => setIssueId(e.target.value)} required>
+              <option value="">Seleccionar expediente</option>
+              {orderedIssues.map((issue) => (
+                <option key={issue.id} value={issue.id}>
+                  {issue.identifier} · {issue.details.nombre}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          <label className="field-label">
+            Tipo de factura
+            <select className="field-input" value={invoiceType} onChange={(e) => setInvoiceType(e.target.value)}>
+              {INVOICE_TYPE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+          </label>
+
+          <label className="field-label billing-form-wide">
+            Concepto
+            <input
+              className="field-input"
+              value={concept}
+              onChange={(e) => setConcept(e.target.value)}
+              placeholder="Ej.: Honorarios iniciales de estudio"
+              required
+            />
+          </label>
+
+          <label className="field-label">
+            Importe (EUR)
+            <input
+              className="field-input"
+              type="number"
+              step="0.01"
+              min="0"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              placeholder="0.00"
+              required
+            />
+          </label>
+
+          <div className="billing-meta">
+            {selectedIssue ? (
+              <>
+                <p><strong>Serie:</strong> {getSeriesPrefix(selectedIssue.details?.tipo)}-{new Date().getUTCFullYear()}-NNNN</p>
+                <p><strong>expedienteId:</strong> {selectedIssue.id}</p>
+                <p><strong>clienteId:</strong> {(selectedIssue.details?.email && selectedIssue.details.email !== '-') ? selectedIssue.details.email.toLowerCase() : selectedIssue.id}</p>
+              </>
+            ) : (
+              <p>Selecciona expediente para calcular serie y vinculos automáticos.</p>
+            )}
+            {successFeeBlocked ? (
+              <p className="billing-warning">Bloqueado: no se permite factura de exito en expediente cerrado sin recuperacion.</p>
+            ) : null}
+          </div>
+
+          <button type="submit" className="btn-primary">Crear factura</button>
+        </form>
+      </section>
+
+      <section className="billing-card">
+        <div className="billing-filters">
+          <label className="field-label">
+            Serie
+            <select className="field-input" value={seriesFilter} onChange={(e) => setSeriesFilter(e.target.value)}>
+              {uniqueSeries.map((series) => (
+                <option key={series} value={series}>{series}</option>
+              ))}
+            </select>
+          </label>
+
+          <label className="field-label">
+            Estado
+            <select className="field-input" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+              {INVOICE_STATE_OPTIONS.map((state) => (
+                <option key={state} value={state}>{state}</option>
+              ))}
+            </select>
+          </label>
+
+          <label className="field-label">
+            Cliente
+            <input className="field-input" value={clientFilter} onChange={(e) => setClientFilter(e.target.value)} placeholder="Nombre cliente" />
+          </label>
+
+          <label className="field-label">
+            Expediente
+            <input className="field-input" value={issueFilter} onChange={(e) => setIssueFilter(e.target.value)} placeholder="LEX-123" />
+          </label>
+        </div>
+
+        <div className="case-table-wrap billing-table-wrap">
+          <table className="case-table billing-table">
+            <thead>
+              <tr>
+                <th>Factura</th>
+                <th>Serie</th>
+                <th>Estado</th>
+                <th>Cliente</th>
+                <th>Expediente</th>
+                <th>Importe</th>
+                <th>Acciones</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filteredInvoices.length === 0 ? (
+                <tr>
+                  <td colSpan="7" className="table-empty">No hay facturas con estos filtros</td>
+                </tr>
+              ) : (
+                filteredInvoices.map((invoice) => (
+                  <tr key={invoice.id} className="case-row">
+                    <td className="case-cell case-cell--name">
+                      {invoice.invoiceNumber}
+                      <div className="billing-subline">{formatInvoiceType(invoice.invoiceType)} · {formatDate(invoice.createdAt)}</div>
+                    </td>
+                    <td className="case-cell">{invoice.seriesPrefix}</td>
+                    <td className="case-cell">{invoice.state}</td>
+                    <td className="case-cell">{invoice.clientName}</td>
+                    <td className="case-cell">{invoice.issueIdentifier}</td>
+                    <td className="case-cell">{formatMoney(invoice.amount)}</td>
+                    <td className="case-cell">
+                      <div className="billing-actions">
+                        <button type="button" className="doc-download-btn" onClick={() => downloadInvoicePdf(invoice)}>
+                          PDF
+                        </button>
+                        <button type="button" className="doc-download-btn" onClick={() => sendInvoiceEmail(invoice)}>
+                          Email
+                        </button>
+                        <button type="button" className="doc-download-btn" onClick={() => updateInvoiceState(invoice.id, 'Pagada')}>
+                          Marcar pagada
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  );
+}
 
 function App() {
   const storedAuthed = localStorage.getItem('lexpanel_authed') === '1';
+  const initialView = window.location.pathname.startsWith('/facturacion') ? 'facturacion' : 'casos';
+
   const [isAuthed, setIsAuthed] = useState(false);
-  const [sessionChecked, setSessionChecked] = useState(!storedAuthed); // skip check if not stored
+  const [sessionChecked, setSessionChecked] = useState(!storedAuthed);
   const [username, setUsername] = useState(localStorage.getItem('lexpanel_user') || 'abogado');
   const [theme, setTheme] = useState(localStorage.getItem('lexpanel_theme') || 'dark');
+  const [activeView, setActiveView] = useState(initialView);
   const [issues, setIssues] = useState([]);
   const [selectedIssueId, setSelectedIssueId] = useState('');
   const [statusFilter, setStatusFilter] = useState('Todos');
@@ -470,10 +925,8 @@ function App() {
     localStorage.setItem('lexpanel_theme', theme);
   }, [theme]);
 
-  // On startup, if localStorage claims authed, verify session is still valid server-side
-  // before rendering the main panel. Prevents the login loop caused by in-memory session loss.
   useEffect(() => {
-    if (!storedAuthed) return; // no stored auth — go straight to login
+    if (!storedAuthed) return;
     fetch('/api/lexpanel/session')
       .then((r) => {
         if (r.ok) {
@@ -484,7 +937,6 @@ function App() {
         }
       })
       .catch(() => {
-        // Server unreachable — clear auth flag and show login
         localStorage.removeItem('lexpanel_authed');
         localStorage.removeItem('lexpanel_user');
       })
@@ -499,7 +951,6 @@ function App() {
       try {
         const [agentList, issueList] = await Promise.all([fetchAgents(), fetchIssues()]);
         if (!active) return;
-        // null = session expired, lexpanel:session-expired event handles logout
         if (!agentList || !issueList) return;
         const legalIds = new Set(
           agentList.filter((a) => LEGAL_AGENT_NAMES.has(a?.name)).map((a) => a.id),
@@ -527,6 +978,14 @@ function App() {
     return () => { active = false; clearInterval(timer); };
   }, [isAuthed, selectedIssueId]);
 
+  useEffect(() => {
+    const onPopState = () => {
+      setActiveView(window.location.pathname.startsWith('/facturacion') ? 'facturacion' : 'casos');
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, []);
+
   const filteredIssues = useMemo(() => {
     if (statusFilter === 'Todos') return issues;
     return issues.filter((i) => i.lexStatus === statusFilter);
@@ -537,7 +996,6 @@ function App() {
     issues.find((i) => i.id === selectedIssueId) ||
     null;
 
-  // KPI stats
   const stats = useMemo(() => {
     const total = issues.length;
     const inProgress = issues.filter((i) => i.lexStatus === 'En proceso').length;
@@ -553,7 +1011,6 @@ function App() {
     setIsAuthed(false);
   };
 
-  // Handle server-side session expiry dispatched by paperclip.js
   useEffect(() => {
     const onExpired = () => logout();
     window.addEventListener('lexpanel:session-expired', onExpired);
@@ -567,12 +1024,29 @@ function App() {
     setIsAuthed(true);
   };
 
-  if (!sessionChecked) return null; // brief wait while session is validated
+  const navigate = (view) => {
+    const nextPath = view === 'facturacion' ? '/facturacion' : '/';
+    if (window.location.pathname !== nextPath || window.location.search) {
+      window.history.pushState({}, '', nextPath);
+    }
+    setActiveView(view);
+  };
+
+  const openAdditionalCharge = (issue) => {
+    const params = new URLSearchParams({
+      issueId: issue.id,
+      invoiceType: 'complementaria',
+      concept: 'Cobro adicional',
+    });
+    window.history.pushState({}, '', `/facturacion?${params.toString()}`);
+    setActiveView('facturacion');
+  };
+
+  if (!sessionChecked) return null;
   if (!isAuthed) return <Login onLogin={onLogin} />;
 
   return (
     <div className="app-shell">
-      {/* ── Sidebar ── */}
       <aside className="sidebar">
         <div className="sidebar-top">
           <div className="sidebar-brand">
@@ -586,9 +1060,21 @@ function App() {
           </div>
 
           <nav className="sidebar-nav">
-            <button type="button" className="sidebar-nav-item sidebar-nav-item--active">
+            <button
+              type="button"
+              className={`sidebar-nav-item ${activeView === 'casos' ? 'sidebar-nav-item--active' : ''}`}
+              onClick={() => navigate('casos')}
+            >
               <IconBriefcase />
               <span>Casos</span>
+            </button>
+            <button
+              type="button"
+              className={`sidebar-nav-item ${activeView === 'facturacion' ? 'sidebar-nav-item--active' : ''}`}
+              onClick={() => navigate('facturacion')}
+            >
+              <IconReceipt />
+              <span>Facturacion</span>
             </button>
           </nav>
         </div>
@@ -607,138 +1093,135 @@ function App() {
             >
               {theme === 'dark' ? <IconSun /> : <IconMoon />}
             </button>
-            <button type="button" className="sidebar-icon-btn" onClick={logout} title="Cerrar sesión">
+            <button type="button" className="sidebar-icon-btn" onClick={logout} title="Cerrar sesion">
               <IconLogOut />
             </button>
           </div>
         </div>
       </aside>
 
-      {/* ── Main ── */}
       <div className="main-area">
-        {/* Page header */}
-        <div className="page-header">
-          <div>
-            <h1 className="page-title">Casos activos</h1>
-            <p className="page-subtitle">
-              {refreshAt ? `Actualizado ${formatDate(refreshAt)}` : 'Cargando…'}
-            </p>
-          </div>
-        </div>
+        {activeView === 'facturacion' ? (
+          <BillingModule issues={issues} />
+        ) : (
+          <>
+            <div className="page-header">
+              <div>
+                <h1 className="page-title">Casos activos</h1>
+                <p className="page-subtitle">
+                  {refreshAt ? `Actualizado ${formatDate(refreshAt)}` : 'Cargando...'}
+                </p>
+              </div>
+            </div>
 
-        {/* KPI row */}
-        <div className="stats-row">
-          <StatCard label="Total casos" value={loading ? '…' : stats.total} />
-          <StatCard label="En proceso" value={loading ? '…' : stats.inProgress} accent />
-          <StatCard label="Pendiente docs" value={loading ? '…' : stats.pending} />
-          <StatCard label="Total cobrado" value={loading ? '…' : formatMoney(stats.totalCobrado)} accent />
-        </div>
+            <div className="stats-row">
+              <StatCard label="Total casos" value={loading ? '...' : stats.total} />
+              <StatCard label="En proceso" value={loading ? '...' : stats.inProgress} accent />
+              <StatCard label="Pendiente docs" value={loading ? '...' : stats.pending} />
+              <StatCard label="Total cobrado" value={loading ? '...' : formatMoney(stats.totalCobrado)} accent />
+            </div>
 
-        {/* Error banner */}
-        {error ? (
-          <div className="error-banner">{error}</div>
-        ) : null}
+            {error ? (
+              <div className="error-banner">{error}</div>
+            ) : null}
 
-        {/* Filter pills */}
-        <div className="filter-row">
-          {STATUS_OPTIONS.map((opt) => (
-            <button
-              key={opt}
-              type="button"
-              onClick={() => setStatusFilter(opt)}
-              className={`filter-pill ${statusFilter === opt ? 'filter-pill--active' : ''}`}
-            >
-              {opt}
-            </button>
-          ))}
-          <span className="filter-count">
-            {filteredIssues.length} caso{filteredIssues.length !== 1 ? 's' : ''}
-          </span>
-        </div>
+            <div className="filter-row">
+              {STATUS_OPTIONS.map((opt) => (
+                <button
+                  key={opt}
+                  type="button"
+                  onClick={() => setStatusFilter(opt)}
+                  className={`filter-pill ${statusFilter === opt ? 'filter-pill--active' : ''}`}
+                >
+                  {opt}
+                </button>
+              ))}
+              <span className="filter-count">
+                {filteredIssues.length} caso{filteredIssues.length !== 1 ? 's' : ''}
+              </span>
+            </div>
 
-        {/* Content grid */}
-        <div className={`content-grid ${selectedIssue ? 'content-grid--split' : ''}`}>
-          {/* Case list */}
-          <section className="case-list-panel">
-            {/* Desktop table */}
-            <div className="case-table-wrap">
-              <table className="case-table">
-                <thead>
-                  <tr>
-                    <th>Cliente</th>
-                    <th>Tipo</th>
-                    <th>Reclamado</th>
-                    <th>Cobrado</th>
-                    <th>Estado</th>
-                    <th>Actualizado</th>
-                    <th />
-                  </tr>
-                </thead>
-                <tbody>
+            <div className={`content-grid ${selectedIssue ? 'content-grid--split' : ''}`}>
+              <section className="case-list-panel">
+                <div className="case-table-wrap">
+                  <table className="case-table">
+                    <thead>
+                      <tr>
+                        <th>Cliente</th>
+                        <th>Tipo</th>
+                        <th>Reclamado</th>
+                        <th>Cobrado</th>
+                        <th>Estado</th>
+                        <th>Actualizado</th>
+                        <th />
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {loading ? (
+                        <tr>
+                          <td colSpan="7" className="table-empty">Cargando casos...</td>
+                        </tr>
+                      ) : filteredIssues.length === 0 ? (
+                        <tr>
+                          <td colSpan="7" className="table-empty">No hay casos para este filtro</td>
+                        </tr>
+                      ) : (
+                        filteredIssues.map((issue) => (
+                          <tr
+                            key={issue.id}
+                            onClick={() => setSelectedIssueId(issue.id)}
+                            className={`case-row ${selectedIssueId === issue.id ? 'case-row--active' : ''}`}
+                          >
+                            <td className="case-cell case-cell--name">{issue.details.nombre}</td>
+                            <td className="case-cell case-cell--muted">{issue.details.tipo}</td>
+                            <td className="case-cell">{formatMoney(issue.details.importeReclamado)}</td>
+                            <td className="case-cell">{formatMoney(issue.details.importeCobrado)}</td>
+                            <td className="case-cell"><StatusBadge status={issue.lexStatus} /></td>
+                            <td className="case-cell case-cell--muted">{formatDate(issue.updatedAt)}</td>
+                            <td className="case-cell case-cell--chevron"><IconChevronRight /></td>
+                          </tr>
+                        ))
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="case-cards">
                   {loading ? (
-                    <tr>
-                      <td colSpan="7" className="table-empty">Cargando casos…</td>
-                    </tr>
+                    <p className="doc-empty">Cargando casos...</p>
                   ) : filteredIssues.length === 0 ? (
-                    <tr>
-                      <td colSpan="7" className="table-empty">No hay casos para este filtro</td>
-                    </tr>
+                    <p className="doc-empty">No hay casos para este filtro</p>
                   ) : (
                     filteredIssues.map((issue) => (
-                      <tr
+                      <button
                         key={issue.id}
+                        type="button"
                         onClick={() => setSelectedIssueId(issue.id)}
-                        className={`case-row ${selectedIssueId === issue.id ? 'case-row--active' : ''}`}
+                        className={`case-card ${selectedIssueId === issue.id ? 'case-card--active' : ''}`}
                       >
-                        <td className="case-cell case-cell--name">{issue.details.nombre}</td>
-                        <td className="case-cell case-cell--muted">{issue.details.tipo}</td>
-                        <td className="case-cell">{formatMoney(issue.details.importeReclamado)}</td>
-                        <td className="case-cell">{formatMoney(issue.details.importeCobrado)}</td>
-                        <td className="case-cell"><StatusBadge status={issue.lexStatus} /></td>
-                        <td className="case-cell case-cell--muted">{formatDate(issue.updatedAt)}</td>
-                        <td className="case-cell case-cell--chevron"><IconChevronRight /></td>
-                      </tr>
+                        <div className="case-card-top">
+                          <p className="case-card-name">{issue.details.nombre}</p>
+                          <StatusBadge status={issue.lexStatus} />
+                        </div>
+                        <p className="case-card-tipo">{issue.details.tipo}</p>
+                        <div className="case-card-bottom">
+                          <span>{formatMoney(issue.details.importeReclamado)}</span>
+                          <span className="case-cell--muted">{formatDate(issue.updatedAt)}</span>
+                        </div>
+                      </button>
                     ))
                   )}
-                </tbody>
-              </table>
-            </div>
+                </div>
+              </section>
 
-            {/* Mobile cards */}
-            <div className="case-cards">
-              {loading ? (
-                <p className="doc-empty">Cargando casos…</p>
-              ) : filteredIssues.length === 0 ? (
-                <p className="doc-empty">No hay casos para este filtro</p>
-              ) : (
-                filteredIssues.map((issue) => (
-                  <button
-                    key={issue.id}
-                    type="button"
-                    onClick={() => setSelectedIssueId(issue.id)}
-                    className={`case-card ${selectedIssueId === issue.id ? 'case-card--active' : ''}`}
-                  >
-                    <div className="case-card-top">
-                      <p className="case-card-name">{issue.details.nombre}</p>
-                      <StatusBadge status={issue.lexStatus} />
-                    </div>
-                    <p className="case-card-tipo">{issue.details.tipo}</p>
-                    <div className="case-card-bottom">
-                      <span>{formatMoney(issue.details.importeReclamado)}</span>
-                      <span className="case-cell--muted">{formatDate(issue.updatedAt)}</span>
-                    </div>
-                  </button>
-                ))
-              )}
+              <CaseDetail
+                issue={selectedIssue}
+                onClose={() => setSelectedIssueId('')}
+                onAddAdditionalCharge={openAdditionalCharge}
+              />
             </div>
-          </section>
-
-          {/* Detail panel */}
-          <CaseDetail
-            issue={selectedIssue}
-            onClose={() => setSelectedIssueId('')}
-          />
-        </div>
+          </>
+        )}
       </div>
     </div>
   );
